@@ -331,15 +331,25 @@ GithubProvider({
 
 `client_id` 由消费者在 `/authorize` 请求的 URL 查询参数中传递，OpenAuth 内部将其存储在加密 cookie 中并在 `subject()` 签发 token 时使用，但 `success` 回调的参数不直接暴露 `client_id`。解决方案：使用 `patch-package` 对 OpenAuth 打补丁，在 `success` 的 `value` 参数中注入 `client_id`。
 
-**补丁内容**（`dist/esm/issuer.js` 第 114-117 行附近）：
+**补丁内容**（`dist/esm/issuer.js` 第 66-117 行）：
 
 ```diff
-  }, {
-    provider: ctx.get("provider"),
-+   client_id: authorization.client_id,
-    ...properties
-  }, ctx.req.raw);
+     async success(ctx, properties, successOpts) {
++      const authorization = await getAuthorization(ctx);
+       return await input.success({
+         async subject(type, properties2, subjectOpts) {
+           const authorization = await getAuthorization(ctx);
+           // ... 不变
+         }
+       }, {
+         provider: ctx.get("provider"),
++        clientID: authorization.client_id,
+         ...properties
+       }, ctx.req.raw);
+     },
 ```
+
+> **说明**：外层提前获取 `authorization`（第 67 行之前），内层 `subject` 保持不变，两次 `getAuthorization` 调用无副作用（仅从加密 cookie 读取）。注入 key 采用 `clientID`（驼峰）与 OpenAuth 内部风格一致。
 
 **操作步骤**：
 1. 手动修改 `node_modules/@openauthjs/openauth/dist/esm/issuer.js`
@@ -350,15 +360,15 @@ GithubProvider({
 
 ```typescript
 success: async (ctx, value) => {
-  // value.client_id 可直接使用，无需中间件
+  // value.clientID 可直接使用，无需中间件
   return ctx.subject('user', {
-    id: await getOrCreateUser(env, value.email, value.client_id),
+    id: await getOrCreateUser(env, value.email, value.clientID),
   });
 }
 ```
 
 合并逻辑：
-1. 按 `(value.client_id, value.email)` 查询 `user` 表是否存在该用户
+1. 按 `(value.clientID, value.email)` 查询 `user` 表是否存在该用户
 2. 若存在，在 `oauth_account` 中绑定新的提供商记录（`PRIMARY KEY (client_id, provider, provider_user_id)` 确保不重复）
 3. 若不存在，创建新 `user`（含 `client_id`）+ `oauth_account`
 
@@ -559,7 +569,7 @@ wrangler d1 execute AUTH_DB --remote --command "SELECT * FROM openauth_store LIM
 - [ ] 配置 `PasswordProvider` + `PasswordUI`（启用 password 字段）
 - [ ] 实现 `sendCode` 回调（通过环境变量切换开发/生产模式，开发阶段输出至日志）
 - [ ] 实现密码 hash 验证逻辑（OpenAuth 内置）
-- [ ] 实现 `success` 回调中的 `getOrCreateUser` 逻辑（按 `value.client_id` + `value.email` 查找/创建用户）
+- [ ] 实现 `success` 回调中的 `getOrCreateUser` 逻辑（按 `value.clientID` + `value.email` 查找/创建用户）
 - [ ] 自定义主题（`theme` 配置）
 - [ ] 测试：浏览器打开登录页 → 输入邮箱+密码 → 登录成功获取 token
 - [ ] 测试：注册流程（输入邮箱+密码 → 输入验证码 → 创建账户）

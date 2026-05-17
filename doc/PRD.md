@@ -170,13 +170,14 @@ const client = createClient({
 | 验证库 | valibot 1.2.0 | 标准 schema 验证，轻量 |
 | 类型 | TypeScript strict | 严格模式 |
 | 部署 | Wrangler CLI | `wrangler dev` / `wrangler deploy` |
+| 补丁 | patch-package | 用于对 OpenAuth 打补丁（如注入 `client_id`），通过 `postinstall` 钩子自动应用 |
 
 ### 3.2 关键决策
 
 #### 3.2.1 为什么用 D1 替代 KV？
 
 - 原模板使用 KV（`CloudflareStorage`）存储 refresh token、password hash 等
-- Cloudflare 免费用户的 KV 免费额度太小（每天 10 万次读取、1000 次写入），不足以支撑认证服务的日常流量；D1 免费额度（每月 500 万行读取）充裕得多
+- Cloudflare 免费用户的 KV 免费额度太小（每天 10 万次读取、1000 次写入/删除/列出），不足以支撑认证服务的日常流量；D1 免费额度（每天 5 百万行读取、10 万行写入）充裕得多
 - D1 提供 SQL 查询能力，更利于后续扩展（如用户管理、账户关联、审计日志）
 - 需**自实现 D1Storage Adapter**（实现 OpenAuth 的 Storage 接口），因为官方暂无 D1 适配器
 
@@ -255,7 +256,7 @@ CREATE TABLE IF NOT EXISTS verification_code (
   id TEXT PRIMARY KEY NOT NULL DEFAULT (lower(hex(randomblob(16)))),
   email TEXT NOT NULL,
   code TEXT NOT NULL,
-  purpose TEXT NOT NULL DEFAULT 'login',  -- 'login' | 'register' | 'change_password'
+  purpose TEXT NOT NULL DEFAULT 'register',  -- 'register' | 'change_password'
   expires_at TIMESTAMP NOT NULL,
   used INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -269,6 +270,8 @@ CREATE TABLE IF NOT EXISTS openauth_store (
   expires_at TIMESTAMP,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_openauth_store_expires ON openauth_store(expires_at);
 ```
 
 ### 4.2 表说明
@@ -278,7 +281,7 @@ CREATE TABLE IF NOT EXISTS openauth_store (
 | `user` | 本地用户主表。`client_id` 标识所属消费者（如 service-a、service-b），`UNIQUE(client_id, email)` 确保每个消费者下邮箱唯一，不同消费者间可存在相同邮箱的独立账号 |
 | `oauth_account` | 关联第三方 OAuth 账户。`client_id` 作为联合主键的一部分，同一第三方账户可在不同消费者下绑定不同本地用户 |
 | `verification_code` | 存储邮箱验证码，带过期时间和使用标记 |
-| `openauth_store` | **核心**：实现 OpenAuth Storage 接口的 D1 实现，替代 KV 的 `get(key)/set(key,value)/delete(key)`。内部存储 password hash、refresh token、authorization code 等 OpenAuth 运行时数据 |
+| `openauth_store` | **核心**：实现 OpenAuth Storage 接口的 D1 实现，替代 KV 的 `get(key)/set(key,value)/delete(key)`。内部存储 password hash、refresh token、authorization code 等 OpenAuth 运行时数据。过期记录在查询时通过 `expires_at` 条件过滤，建议通过定期任务（Cron Trigger）或 D1 行级 TTL 清理过期数据以控制存储用量 |
 
 ---
 
@@ -292,7 +295,7 @@ CREATE TABLE IF NOT EXISTS openauth_store (
 - **登录**：输入邮箱 + 密码 → 验证通过 → 返回 token
 - **找回密码**：输入邮箱 → 发送验证码 → 输入验证码 + 新密码 → 更新密码
 
-验证码发送：开发阶段使用 `console.log` 输出至 Worker 日志（通过 `wrangler tail` 查看），生产环境对接 Resend / SendGrid 等邮件服务。
+验证码发送：通过 `src/utils/email.ts` 封装邮件发送逻辑，使用环境变量（如 `EMAIL_PROVIDER`）控制切换——开发阶段设为 `console` 时输出至 Worker 日志（通过 `wrangler tail` 查看），生产环境设为 `resend`/`sendgrid` 时对接真实邮件服务。密钥（API Key 等）通过 `wrangler secret put` 设置。
 
 ### 5.2 Google OAuth
 
@@ -324,12 +327,40 @@ GithubProvider({
 
 ### 5.4 用户合并策略
 
-每个消费者 Worker 拥有独立的用户命名空间（通过 `client_id` 隔离），因此合并策略作用域限定在**同一 client 内部**：
+每个消费者 Worker 拥有独立的用户命名空间（通过 `client_id` 隔离），因此合并策略作用域限定在**同一 client 内部**。
 
-1. 在 `success` 回调中获取当前请求的 `client_id`（通过 `auth_flow` cookie 传递）
-2. 按 `(client_id, email)` 查询 `user` 表是否存在该用户
-3. 若存在，在 `oauth_account` 中绑定新的提供商记录（`PRIMARY KEY (client_id, provider, provider_user_id)` 确保不重复）
-4. 若不存在，创建新 `user`（含 `client_id`）+ `oauth_account`
+`client_id` 由消费者在 `/authorize` 请求的 URL 查询参数中传递，OpenAuth 内部将其存储在加密 cookie 中并在 `subject()` 签发 token 时使用，但 `success` 回调的参数不直接暴露 `client_id`。解决方案：使用 `patch-package` 对 OpenAuth 打补丁，在 `success` 的 `value` 参数中注入 `client_id`。
+
+**补丁内容**（`dist/esm/issuer.js` 第 114-117 行附近）：
+
+```diff
+  }, {
+    provider: ctx.get("provider"),
++   client_id: authorization.client_id,
+    ...properties
+  }, ctx.req.raw);
+```
+
+**操作步骤**：
+1. 手动修改 `node_modules/@openauthjs/openauth/dist/esm/issuer.js`
+2. 运行 `npx patch-package @openauthjs/openauth` 生成 `patches/@openauthjs+openauth+0.4.3.patch`
+3. 在 `package.json` 添加 `"postinstall": "patch-package"`，确保每次 `npm install` 自动应用补丁
+
+**补丁后 `success` 回调直接使用**：
+
+```typescript
+success: async (ctx, value) => {
+  // value.client_id 可直接使用，无需中间件
+  return ctx.subject('user', {
+    id: await getOrCreateUser(env, value.email, value.client_id),
+  });
+}
+```
+
+合并逻辑：
+1. 按 `(value.client_id, value.email)` 查询 `user` 表是否存在该用户
+2. 若存在，在 `oauth_account` 中绑定新的提供商记录（`PRIMARY KEY (client_id, provider, provider_user_id)` 确保不重复）
+3. 若不存在，创建新 `user`（含 `client_id`）+ `oauth_account`
 
 **跨消费者场景**：同一邮箱可在 Service A 和 Service B 各有一个独立账号。`oauth_account` 的联合主键 `(client_id, provider, provider_user_id)` 允许同一 Google 账号在不同消费者下绑定不同的本地用户。
 
@@ -345,10 +376,10 @@ OpenAuth Storage 接口需要实现：
 
 ```typescript
 interface StorageAdapter {
-  get(key: string[]): Promise<Record<string, unknown> | undefined>;
-  set(key: string[], value: Record<string, unknown>, expiry?: Date): Promise<void>;
+  get(key: string[]): Promise<Record<string, any> | undefined>;
   remove(key: string[]): Promise<void>;
-  scan(prefix: string[]): Promise<{ key: string[]; value: Record<string, unknown> }[]>;
+  set(key: string[], value: any, expiry?: Date): Promise<void>;
+  scan(prefix: string[]): AsyncIterable<[string[], any]>;
 }
 ```
 
@@ -359,7 +390,7 @@ interface StorageAdapter {
 - `get(key)` → `SELECT value FROM openauth_store WHERE key = ? AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)`
 - `set(key, value, expiry?)` → `INSERT OR REPLACE INTO openauth_store (key, value, expires_at) VALUES (?, ?, ?)`
 - `remove(key)` → `DELETE FROM openauth_store WHERE key = ?`
-- `scan(prefix)` → `SELECT key, value FROM openauth_store WHERE key LIKE ? AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)`
+- `scan(prefix)` → 使用生成器函数实现，通过 `SELECT key, value FROM openauth_store WHERE key LIKE ? || '%' AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP) ORDER BY key` 分批查询，以 `AsyncIterable` 逐批 yield 结果
 - key 使用分隔符（如 `:`）拼接数组
 
 ---
@@ -498,10 +529,12 @@ wrangler d1 execute AUTH_DB --remote --command "SELECT * FROM openauth_store LIM
 **目标**：建立可运行的 Worker 骨架
 
 - [ ] 在 `app/` 创建 `package.json`、`tsconfig.json`、`wrangler.jsonc`
-- [ ] 安装依赖：`@openauthjs/openauth`、`valibot`
+- [ ] 在 `package.json` 中配置 `scripts`：`deploy: wrangler deploy`、`predeploy: wrangler d1 migrations apply AUTH_DB --remote`（确保每次部署前自动应用迁移）、`cf-typegen: wrangler types`、`postinstall: patch-package`（确保补丁在每次 `npm install` 后自动应用）
+- [ ] 安装依赖：`@openauthjs/openauth`、`valibot`、`patch-package`
 - [ ] 创建 Cloudflare D1 数据库（远程）
 - [ ] 创建 `app/src/` 目录结构
 - [ ] 编写最小化 `src/index.ts`（用 MemoryStorage 测试能否启动）
+- [ ] 按 5.4 节方案对 OpenAuth 打补丁：修改 `dist/esm/issuer.js`，运行 `npx patch-package @openauthjs/openauth` 生成补丁文件
 - [ ] 运行 `wrangler dev --remote` 验证基本服务可访问
 
 **验收**：`npx tsc --noEmit` 编译通过，浏览器访问 `localhost:8787/.well-known/oauth-authorization-server` 返回 JSON
@@ -510,7 +543,7 @@ wrangler d1 execute AUTH_DB --remote --command "SELECT * FROM openauth_store LIM
 
 **目标**：实现 D1 版本的 OpenAuth Storage，替换模板中的 KV
 
-- [ ] 编写 D1 迁移脚本（user 含 client_id、openauth_store 表）
+- [ ] 编写 D1 迁移脚本（创建 `user`、`oauth_account`、`verification_code`、`openauth_store` 四张表，按编号 0001-0004 顺序创建）
 - [ ] 实现 `src/storage/d1.ts`：`D1Storage` 类，实现 StorageAdapter 接口
 - [ ] 将 `openauth_store` 的 get/set/remove/scan 操作封装
 - [ ] 过期的 key 自动清理或忽略
@@ -524,10 +557,9 @@ wrangler d1 execute AUTH_DB --remote --command "SELECT * FROM openauth_store LIM
 **目标**：实现邮箱+密码登录，邮箱验证码用于注册验证和找回密码
 
 - [ ] 配置 `PasswordProvider` + `PasswordUI`（启用 password 字段）
-- [ ] 实现 `sendCode` 回调（开发阶段 console.log，可通过 `wrangler tail` 查看）
+- [ ] 实现 `sendCode` 回调（通过环境变量切换开发/生产模式，开发阶段输出至日志）
 - [ ] 实现密码 hash 验证逻辑（OpenAuth 内置）
-- [ ] 实现 `success` 回调中的 `getOrCreateUser` 逻辑（按 client_id + email 查找/创建）
-- [ ] 创建 `oauth_account`（含 client_id 联合主键）、`verification_code` 表的迁移脚本
+- [ ] 实现 `success` 回调中的 `getOrCreateUser` 逻辑（按 `value.client_id` + `value.email` 查找/创建用户）
 - [ ] 自定义主题（`theme` 配置）
 - [ ] 测试：浏览器打开登录页 → 输入邮箱+密码 → 登录成功获取 token
 - [ ] 测试：注册流程（输入邮箱+密码 → 输入验证码 → 创建账户）
@@ -568,7 +600,7 @@ wrangler d1 execute AUTH_DB --remote --command "SELECT * FROM openauth_store LIM
 - [ ] 验证 refresh token 刷新流程
 - [ ] 编写 `doc/INTEGRATION.md`：其他 Workers 如何对接到 CfAuth
 - [ ] 编写 `doc/DEVELOPMENT.md`：本地开发环境搭建指南
-- [ ] 代码清理、去除 console.log（生产路径）
+- [ ] 确认邮件发送环境变量配置正确，开发/生产模式切换正常
 
 **验收**：`npx tsc --noEmit` 编译通过，无 floating promise 警告，所有测试脚本通过，文档完整
 
@@ -592,6 +624,8 @@ app/
 ├── wrangler.jsonc
 ├── worker-configuration.d.ts   # 由 `npm run cf-typegen`（即 `wrangler types`）自动生成
 ├── .gitignore
+├── patches/
+│   └── @openauthjs+openauth+0.4.3.patch  # OpenAuth 补丁（注入 client_id）
 ├── migrations/
 │   ├── 0001_create_user_table.sql
 │   ├── 0002_create_oauth_account.sql
@@ -622,8 +656,8 @@ app/
 | D1 Storage Adapter 与 OpenAuth 内部依赖不兼容 | 阶段 1 就引入并验证，出现问题及时调整 |
 | 邮件免费套餐发送量有限 | 验证码仅用于注册和找回密码，日常登录使用密码，大幅降低邮件用量 |
 | OAuth 密钥泄露 | 使用 `wrangler secret` 管理，`.dev.vars` 加入 `.gitignore` |
-| 远程 D1 开发产生费用 | D1 有免费额度（5GB 存储、每月 500 万行读取），开发阶段完全够用 |
-| D1 冷启动延迟 | 首次请求需建立数据库连接导致延迟略高，后续请求复用连接池，可接受 |
+| 远程 D1 开发产生费用 | D1 有免费额度（5GB 存储、每天 5 百万行读取、10 万行写入），开发阶段完全够用 |
+| D1 冷启动延迟 | 首次请求可能遭遇 isolate 冷启动，延迟略高；后续同 isolate 内调用通过 HTTP keep-alive 复用底层连接，可接受 |
 | OpenAuth 版本更新导致 API 变更 | 锁定 `@openauthjs/openauth` 小版本号 |
 
 ---

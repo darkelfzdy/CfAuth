@@ -1,5 +1,7 @@
 # CfAuth — Cloudflare Workers 认证服务 PRD
 
+本项目起源于多个 Cloudflare Worker 各自实现认证逻辑、重复开发且维护成本高的问题。CfAuth 旨在提供一个统一的认证服务中心，将所有 Worker 的认证逻辑集中管理，消除重复劳动。
+
 ## 1. 项目概述
 
 **CfAuth** 是一个部署在 Cloudflare Workers 上的独立认证服务（基于 OpenAuth.js），为其他 Cloudflare Workers 提供统一的认证能力。支持两种集成方式：**标准 OAuth 2.0 HTTP 端点**（适用于外部服务）和 **Cloudflare Service Binding**（适用于同一账号下的 Workers，零网络开销）。
@@ -15,6 +17,12 @@
 ### 1.2 参考基线
 
 以 `openauth-template/` 为技术起点，在其基础上改造，实际代码落在 `app/` 目录。
+
+### 1.3 非目标
+
+- **不提供用户管理后台**：用户的增删改查由业务 Worker 通过 API 自行管理
+- **不提供细粒度权限管理**：RBAC 等由各业务 Worker 自行实现
+- **不提供社交账号信息同步**：仅通过 OAuth 获取邮箱用于身份识别
 
 ---
 
@@ -84,6 +92,22 @@
 
 - 消费者使用 `@openauthjs/openauth/client` 的 `createClient` + `verify` 验证 JWT
 - 无需回调 CfAuth，因为 access_token 是自包含的 JWT，内含用户 subject 信息
+- 消费者代码示例：
+
+```typescript
+import { createClient } from '@openauthjs/openauth/client'
+
+const client = createClient({
+  clientID: 'my-worker',
+  issuer: 'https://cf-auth.your-domain.workers.dev',
+})
+
+// 获取登录 URL
+const { url } = await client.authorize()
+
+// 验证 token
+const verified = await client.verify(subjects, token)
+```
 
 #### 方式 B：Cloudflare Service Binding（推荐，适用于同一账号下的 Workers）
 
@@ -152,6 +176,7 @@ const client = createClient({
 #### 3.2.1 为什么用 D1 替代 KV？
 
 - 原模板使用 KV（`CloudflareStorage`）存储 refresh token、password hash 等
+- Cloudflare 免费用户的 KV 免费额度太小（每天 10 万次读取、1000 次写入），不足以支撑认证服务的日常流量；D1 免费额度（每月 500 万行读取）充裕得多
 - D1 提供 SQL 查询能力，更利于后续扩展（如用户管理、账户关联、审计日志）
 - 需**自实现 D1Storage Adapter**（实现 OpenAuth 的 Storage 接口），因为官方暂无 D1 适配器
 
@@ -443,6 +468,21 @@ curl -X POST http://localhost:8787/token \
 
 编写 vitest 针对 `D1Storage` adapter 进行测试，验证 CRUD 操作和时间戳过期逻辑。
 
+#### 方法四：数据库直接验证
+
+通过 `wrangler d1 execute` 直接查询 D1 确认数据状态，适合开发阶段快速验证：
+
+```bash
+# 查看所有用户
+wrangler d1 execute AUTH_DB --remote --command "SELECT * FROM user"
+
+# 查看某个验证码
+wrangler d1 execute AUTH_DB --remote --command "SELECT * FROM verification_code WHERE email = 'test@example.com'"
+
+# 查看 openauth_store 存储内容
+wrangler d1 execute AUTH_DB --remote --command "SELECT * FROM openauth_store LIMIT 10"
+```
+
 ### 8.3 vitest 配置
 
 注意：vitest 需要在 `nodejs_compat` 兼容模式下运行（与运行时对齐），可使用 `@cloudflare/vitest-pool-workers` 或直接 mock D1 接口进行测试。
@@ -583,6 +623,7 @@ app/
 | 邮件免费套餐发送量有限 | 验证码仅用于注册和找回密码，日常登录使用密码，大幅降低邮件用量 |
 | OAuth 密钥泄露 | 使用 `wrangler secret` 管理，`.dev.vars` 加入 `.gitignore` |
 | 远程 D1 开发产生费用 | D1 有免费额度（5GB 存储、每月 500 万行读取），开发阶段完全够用 |
+| D1 冷启动延迟 | 首次请求需建立数据库连接导致延迟略高，后续请求复用连接池，可接受 |
 | OpenAuth 版本更新导致 API 变更 | 锁定 `@openauthjs/openauth` 小版本号 |
 
 ---

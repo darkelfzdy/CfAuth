@@ -2,12 +2,12 @@
 
 ## 1. 项目概述
 
-**CfAuth** 是一个部署在 Cloudflare Workers 上的独立认证服务（基于 OpenAuth.js），为其他 Cloudflare Workers 提供统一的 OAuth 2.0 认证能力。任何需要认证的工作者项目只需对接本服务即可，无需各自重复开发认证逻辑。
+**CfAuth** 是一个部署在 Cloudflare Workers 上的独立认证服务（基于 OpenAuth.js），为其他 Cloudflare Workers 提供统一的认证能力。支持两种集成方式：**标准 OAuth 2.0 HTTP 端点**（适用于外部服务）和 **Cloudflare Service Binding**（适用于同一账号下的 Workers，零网络开销）。
 
 ### 1.1 核心目标
 
-- **独立部署**：作为一个独立的 Worker 运行，通过 OAuth 2.0 标准协议对外暴露认证能力
-- **多提供商**：支持邮箱+密码（验证码）、Google OAuth、GitHub OAuth 三种登录方式
+- **独立部署**：作为一个独立的 Worker 运行，支持标准 OAuth 2.0 HTTP 端点与 Cloudflare Service Binding 两种集成方式
+- **多提供商**：支持邮箱+密码、Google OAuth、GitHub OAuth 三种登录方式
 - **D1 存储**：不使用 KV，全部持久化存储使用 Cloudflare D1（关系型数据库）
 - **可测试**：即使没有其他消费者 Worker，也能独立完成测试验证
 - **分步可测**：项目按模块拆分，每个模块可独立开发、测试、验收
@@ -54,7 +54,9 @@
 
 ### 2.2 消费者集成方式
 
-其他 Workers 通过标准 OAuth 2.0 授权码流对接：
+提供两种集成方式，根据消费者位置选择：
+
+#### 方式 A：标准 OAuth 2.0 HTTP 端点（适用于外部服务 / 非 Workers 服务）
 
 ```
 消费者 Worker                  CfAuth Worker              第三方 OAuth
@@ -80,6 +82,31 @@
 - 消费者使用 `@openauthjs/openauth/client` 的 `createClient` + `verify` 验证 JWT
 - 无需回调 CfAuth，因为 access_token 是自包含的 JWT，内含用户 subject 信息
 
+#### 方式 B：Cloudflare Service Binding（推荐，适用于同一账号下的 Workers）
+
+消费者 Worker 的 `wrangler.json` 中绑定 CfAuth：
+
+```json
+{
+  "services": [
+    { "binding": "AUTH", "service": "cfauth" }
+  ]
+}
+```
+
+在代码中直接调用：
+
+```typescript
+import { createClient } from '@openauthjs/openauth/client'
+
+const client = createClient({
+  // Service Binding 方式：直接传入 binding
+  fetch: (input, init) => env.AUTH.fetch(input, init),
+})
+```
+
+**优点**：零网络延迟、无公网依赖、部署配置简单。
+
 ---
 
 ## 3. 技术选型
@@ -103,14 +130,14 @@
 - D1 提供 SQL 查询能力，更利于后续扩展（如用户管理、账户关联、审计日志）
 - 需**自实现 D1Storage Adapter**（实现 OpenAuth 的 Storage 接口），因为官方暂无 D1 适配器
 
-#### 3.2.2 邮箱验证码 vs 邮箱+密码？
+#### 3.2.2 为何选择邮箱+密码为主，验证码仅辅助？
 
-采用 **邮箱+验证码** 方案（OpenAuth PasswordProvider 默认），理由：
+采用 **邮箱+密码登录** 为主，邮箱验证码仅用于注册时的邮箱验证和找回密码。理由：
 
-- 无需用户记忆密码，体验更流畅
-- 安全性好（每次登录发送新验证码）
-- OpenAuth `PasswordUI` 已经内置完整实现，包括注册、登录、改密码流程
-- 如需后续添加密码登录，PasswordProvider 表单中已有 password 字段可配置启用
+- **邮件发送量受限**：使用的邮件免费套餐发送量有限，验证码仅用于低频场景（注册、找回密码）
+- **用户体验**：日常登录无需等待邮件，输入密码即可
+- **安全性**：密码存储在 D1（经 OpenAuth 自动 hash），验证码用于关键操作的双重验证
+- OpenAuth PasswordProvider 支持配置 password 字段启用，同时保留 `sendCode` 回调用于验证码场景
 
 #### 3.2.3 为什么本地开发绑定远程组件？
 
@@ -184,13 +211,13 @@ CREATE TABLE IF NOT EXISTS openauth_store (
 
 ## 5. 认证方式详细设计
 
-### 5.1 邮箱验证码（PasswordProvider + PasswordUI）
+### 5.1 邮箱+密码（PasswordProvider + PasswordUI）
 
-OpenAuth 内置的 PasswordProvider 使用验证码流程，适合本项目：
+使用 OpenAuth PasswordProvider，配置启用 password 字段。验证码仅用于注册验证和找回密码：
 
-- **注册**：输入邮箱 → 发送验证码至邮箱 → 输入验证码验证 → 创建账户
-- **登录**：输入邮箱 → 发送验证码至邮箱 → 输入验证码验证 → 返回 token
-- **改密码**：输入邮箱 → 发送验证码 → 输入新密码
+- **注册**：输入邮箱 → 设置密码 → 发送验证码至邮箱 → 输入验证码验证 → 创建账户
+- **登录**：输入邮箱 + 密码 → 验证通过 → 返回 token
+- **找回密码**：输入邮箱 → 发送验证码 → 输入验证码 + 新密码 → 更新密码
 
 验证码发送：开发阶段使用 `console.log` 输出至 Worker 日志（通过 `wrangler tail` 查看），生产环境对接 Resend / SendGrid 等邮件服务。
 
@@ -206,6 +233,8 @@ GoogleProvider({
 
 在 Google Cloud Console 创建 OAuth 2.0 凭据，密钥通过 `wrangler secret put` 设置。
 
+**此服务完全免费**，无需购买任何付费套餐。只需在 Google Cloud Console 中创建一个 OAuth 2.0 客户端 ID（Web 应用类型），填写授权的重定向 URI 即可获取凭据。
+
 ### 5.3 GitHub OAuth
 
 ```
@@ -217,6 +246,8 @@ GithubProvider({
 ```
 
 在 GitHub Developer Settings 创建 OAuth App，密钥通过 `wrangler secret put` 设置。
+
+**此服务完全免费**，无需购买任何付费套餐。在 GitHub Developer Settings → OAuth Apps 中创建一个新应用，填写 Homepage URL 和 Authorization callback URL 即可获取 `client_id` 和 `client_secret`。
 
 ### 5.4 用户合并策略
 
@@ -390,18 +421,20 @@ curl -X POST http://localhost:8787/token \
 
 **验收**：使用 `D1Storage` 的 issuer 能正常启动，`/.well-known/oauth-authorization-server` 正常响应
 
-### 阶段 2：邮箱验证码认证（PasswordProvider）
+### 阶段 2：邮箱+密码认证（PasswordProvider）
 
-**目标**：实现邮箱验证码登录/注册的完整流程
+**目标**：实现邮箱+密码登录，邮箱验证码用于注册验证和找回密码
 
-- [ ] 配置 `PasswordProvider` + `PasswordUI`
+- [ ] 配置 `PasswordProvider` + `PasswordUI`（启用 password 字段）
 - [ ] 实现 `sendCode` 回调（开发阶段 console.log，可通过 `wrangler tail` 查看）
+- [ ] 实现密码 hash 验证逻辑（OpenAuth 内置）
 - [ ] 实现 `success` 回调中的 `getOrCreateUser` 逻辑
 - [ ] 创建 `oauth_account`、`verification_code` 表的迁移脚本
 - [ ] 自定义主题（`theme` 配置）
-- [ ] 测试：浏览器打开登录页 → 输入邮箱 → 查看日志获取验证码 → 输入验证码 → 获得 token
+- [ ] 测试：浏览器打开登录页 → 输入邮箱+密码 → 登录成功获取 token
+- [ ] 测试：注册流程（输入邮箱+密码 → 输入验证码 → 创建账户）
 
-**验收**：完整邮箱验证码注册+登录流程走通，能获取到 access_token
+**验收**：邮箱+密码登录流程走通，注册验证码流程走通，能获取到 access_token
 
 ### 阶段 3：Google OAuth 认证
 
@@ -472,7 +505,7 @@ app/
 │   ├── storage/
 │   │   └── d1.ts               # D1Storage adapter 实现
 │   ├── providers/
-│   │   └── password.ts         # 邮箱验证码相关配置
+│   │   └── password.ts         # 邮箱+密码认证相关配置
 │   ├── db/
 │   │   └── user.ts             # 用户 CRUD 操作
 │   └── utils/
@@ -489,7 +522,7 @@ app/
 | 风险 | 应对 |
 |------|------|
 | D1 Storage Adapter 与 OpenAuth 内部依赖不兼容 | 阶段 1 就引入并验证，出现问题及时调整 |
-| OpenAuth PasswordProvider 默认流程含密码字段 | 查阅 PasswordUI 文档，确认纯验证码模式配置方式 |
+| 邮件免费套餐发送量有限 | 验证码仅用于注册和找回密码，日常登录使用密码，大幅降低邮件用量 |
 | OAuth 密钥泄露 | 使用 `wrangler secret` 管理，`.dev.vars` 加入 `.gitignore` |
 | 远程 D1 开发产生费用 | D1 有免费额度（5GB 存储、每月 500 万行读取），开发阶段完全够用 |
 | OpenAuth 版本更新导致 API 变更 | 锁定 `@openauthjs/openauth` 小版本号 |

@@ -359,13 +359,15 @@ GithubProvider({
 **补丁后 `success` 回调直接使用**：
 
 ```typescript
-success: async (ctx, value) => {
-  // value.clientID 可直接使用，无需中间件
+success: async (ctx, value: { provider: string; email: string; clientID: string }) => {
+  // value.clientID 由补丁注入
   return ctx.subject('user', {
     id: await getOrCreateUser(env, value.email, value.clientID),
   });
 }
 ```
+
+> **注意**：补丁只修改运行时代码（`dist/esm/issuer.js`），不更新 TypeScript 类型声明（`dist/types/*.d.ts`）。因此 `value.clientID` 在编译期间不可见，需为 `value` 参数手动标注类型（如上所示例），或通过 `as { clientID: string }` 类型断言。
 
 合并逻辑：
 1. 按 `(value.clientID, value.email)` 查询 `user` 表是否存在该用户
